@@ -1,197 +1,231 @@
 #![windows_subsystem = "windows"]
 
-use sfml::graphics::{
-    Color, Rect, RenderTarget, RenderWindow, Sprite, Texture, Transformable, View,
+use futures::executor::block_on;
+use winit::{
+    event::*,
+    event_loop::{ControlFlow, EventLoop},
+    window::{Window, WindowBuilder},
 };
-use sfml::system::{Vector2f, Vector2i};
-use sfml::window::{ContextSettings, Event, Key, Style, VideoMode};
-use sfml::window::mouse::Button;
 
-const TITLE: &str = "vimg";
-
-#[derive(Copy, Clone, Debug)]
-enum WinStyle {
-    Default,
-    Fullscreen,
+struct State {
+    surface: wgpu::Surface,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    sc_desc: wgpu::SwapChainDescriptor,
+    swap_chain: wgpu::SwapChain,
+    size: winit::dpi::PhysicalSize<u32>,
+    render_pipeline: wgpu::RenderPipeline,
 }
 
-impl WinStyle {
-    pub fn get_style(self) -> Style {
-        match self {
-            Self::Default => Style::default(),
-            Self::Fullscreen => Style::NONE,
+impl State {
+    async fn new(window: &Window) -> Self {
+        let size = window.inner_size();
+        let instance = wgpu::Instance::new(wgpu::BackendBit::PRIMARY);
+        let surface = unsafe { instance.create_surface(window) };
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::Default,
+                compatible_surface: Some(&surface),
+            })
+            .await
+            .unwrap();
+
+        let (device, queue) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    features: wgpu::Features::empty(),
+                    limits: wgpu::Limits::default(),
+                    shader_validation: true,
+                },
+                None, // Trace path
+            )
+            .await
+            .unwrap();
+
+        let sc_desc = wgpu::SwapChainDescriptor {
+            usage: wgpu::TextureUsage::OUTPUT_ATTACHMENT,
+            format: wgpu::TextureFormat::Bgra8UnormSrgb,
+            width: size.width,
+            height: size.height,
+            present_mode: wgpu::PresentMode::Fifo,
+        };
+        let swap_chain = device.create_swap_chain(&surface, &sc_desc);
+
+        let vs_module;
+        let fs_module;
+        if cfg!(embedded_shaders) {
+            let vs_src = include_str!("shader.vert");
+            let fs_src = include_str!("shader.frag");
+            let mut compiler = shaderc::Compiler::new().unwrap();
+            let vs_spirv = compiler
+                .compile_into_spirv(
+                    vs_src,
+                    shaderc::ShaderKind::Vertex,
+                    "shader.vert",
+                    "main",
+                    None,
+                )
+                .unwrap();
+            let fs_spirv = compiler
+                .compile_into_spirv(
+                    fs_src,
+                    shaderc::ShaderKind::Fragment,
+                    "shader.frag",
+                    "main",
+                    None,
+                )
+                .unwrap();
+            vs_module =
+                device.create_shader_module(wgpu::util::make_spirv(&vs_spirv.as_binary_u8()));
+            fs_module =
+                device.create_shader_module(wgpu::util::make_spirv(&fs_spirv.as_binary_u8()));
+        } else {
+            vs_module = device.create_shader_module(wgpu::include_spirv!("shader.vert.spv"));
+            fs_module = device.create_shader_module(wgpu::include_spirv!("shader.frag.spv"));
         }
+
+        let render_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Render Pipeline Layout"),
+                bind_group_layouts: &[],
+                push_constant_ranges: &[],
+            });
+        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Render Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex_stage: wgpu::ProgrammableStageDescriptor {
+                module: &vs_module,
+                entry_point: "main",
+            },
+            fragment_stage: Some(wgpu::ProgrammableStageDescriptor {
+                module: &fs_module,
+                entry_point: "main",
+            }),
+            rasterization_state: Some(wgpu::RasterizationStateDescriptor {
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: wgpu::CullMode::Back,
+                depth_bias: 0,
+                depth_bias_slope_scale: 0.0,
+                depth_bias_clamp: 0.0,
+                clamp_depth: false,
+            }),
+            color_states: &[wgpu::ColorStateDescriptor {
+                format: sc_desc.format,
+                color_blend: wgpu::BlendDescriptor::REPLACE,
+                alpha_blend: wgpu::BlendDescriptor::REPLACE,
+                write_mask: wgpu::ColorWrite::ALL,
+            }],
+            primitive_topology: wgpu::PrimitiveTopology::TriangleList,
+            depth_stencil_state: None,
+            vertex_state: wgpu::VertexStateDescriptor {
+                index_format: wgpu::IndexFormat::Uint16,
+                vertex_buffers: &[],
+            },
+            sample_count: 1,
+            sample_mask: !0,
+            alpha_to_coverage_enabled: false,
+        });
+
+        Self {
+            surface,
+            device,
+            queue,
+            sc_desc,
+            swap_chain,
+            size,
+            render_pipeline,
+        }
+    }
+
+    fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
+        self.size = new_size;
+        self.sc_desc.width = new_size.width;
+        self.sc_desc.height = new_size.height;
+        self.swap_chain = self.device.create_swap_chain(&self.surface, &self.sc_desc);
+    }
+
+    /// Returns true if the event was fully processed.
+    fn input(&mut self, _event: &WindowEvent) -> bool {
+        false
+    }
+
+    fn update(&mut self) {}
+
+    fn render(&mut self) {
+        let cur_frame = self.swap_chain.get_current_frame();
+        if cur_frame.is_err() { return; }
+
+        let frame = cur_frame.expect("Timeout getting texture").output;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Render Encoder"),
+            });
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                color_attachments: &[wgpu::RenderPassColorAttachmentDescriptor {
+                    attachment: &frame.view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.1,
+                            g: 0.2,
+                            b: 0.3,
+                            a: 1.0,
+                        }),
+                        store: true,
+                    },
+                }],
+                depth_stencil_attachment: None,
+            });
+
+            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.draw(0..3, 0..1);
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
     }
 }
 
 fn main() {
-    let mut args = std::env::args();
-    args.next();
-    let img_path = args.next().unwrap();
+    env_logger::init();
+    let event_loop = EventLoop::new();
+    let window = WindowBuilder::new().build(&event_loop).unwrap();
+    let mut state = block_on(State::new(&window));
 
-    let desktop_mode = VideoMode::desktop_mode();
-    let mut cur_style = WinStyle::Default;
-    let ctx_settings = ContextSettings::default();
-
-    let target_size = (desktop_mode.width, desktop_mode.height);
-    let mut win = RenderWindow::new(desktop_mode, TITLE, cur_style.get_style(), &ctx_settings);
-    // #TODO: maximize the window
-    // let handle = win.system_handle();
-    // unsafe { ShowWindow(handle, SW_MAXIMIZE); }
-    win.set_position(Vector2i::default());
-    win.set_vertical_sync_enabled(true);
-
-    let mut scheduled_win_change: Option<RenderWindow> = None;
-
-    let mut tex = Texture::from_file(&img_path).unwrap();
-    tex.set_smooth(true);
-    let mut sprite = Sprite::with_texture(&*tex);
-    // Center and maximize image
-    center_and_maximize(&win, &tex, &mut sprite);
-
-    let win_real_size = win.size();
-    let mut view = View::from_rect(&Rect::new(0.0, 0.0, win_real_size.x as f32, win_real_size.y as f32));
-    win.set_view(&view);
-
-    let mut dragging = false;
-    let mut prev_mouse_pos = Vector2i::default();
-
-    let mut dirty = true;
-
-    loop {
-        if let Some(event) = win.wait_event() {
-            match event {
-                Event::Closed | Event::KeyPressed { code: Key::Q, .. } => return,
-                Event::KeyPressed { code, .. } => match code {
-                    Key::F => {
-                        cur_style = match cur_style {
-                            WinStyle::Default => WinStyle::Fullscreen,
-                            WinStyle::Fullscreen => WinStyle::Default,
-                        };
-                        scheduled_win_change = Some(RenderWindow::new(
-                            desktop_mode,
-                            TITLE,
-                            cur_style.get_style(),
-                            &ctx_settings,
-                        ));
+    event_loop.run(move |event, _, control_flow| match event {
+        Event::WindowEvent {
+            ref event,
+            window_id,
+        } if window_id == window.id() => {
+            if !state.input(event) {
+                match event {
+                    WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
+                    WindowEvent::KeyboardInput { input, .. } => match input {
+                        KeyboardInput {
+                            state: ElementState::Pressed,
+                            virtual_keycode: Some(VirtualKeyCode::Q),
+                            ..
+                        } => *control_flow = ControlFlow::Exit,
+                        _ => {}
+                    },
+                    WindowEvent::Resized(phys_size) => {
+                        state.resize(*phys_size);
                     }
-                    Key::Num0 | Key::Numpad0 => {
-                        sprite.set_scale(Vector2f::new(1.0, 1.0));
-                        dirty = true;
-                    }
-                    Key::R => {
-                        center_and_maximize(&win, &tex, &mut sprite);
-                        dirty = true;
+                    WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
+                        state.resize(**new_inner_size);
                     }
                     _ => {}
-                },
-                Event::Resized { width, height } => {
-                    let viewport = resize_keep_ratio(width, height, target_size);
-                    let view_rect = Rect::new(0.0, 0.0, target_size.0 as f32, target_size.1 as f32);
-                    let mut view = View::from_rect(&view_rect);
-                    view.set_viewport(&viewport);
-                    win.set_view(&view);
-                    dirty = true;
                 }
-                Event::MouseWheelScrolled { delta, .. } => {
-                    let factor = if delta < 0.0 { 1.1 } else { 0.9 };
-                    view.zoom(factor);
-                    win.set_view(&view);
-                    dirty = true;
-                }
-                Event::MouseButtonPressed {
-                    button: Button::Left,
-                    ..
-                } => {
-                    dragging = true;
-                }
-                Event::MouseButtonReleased {
-                    button: Button::Left,
-                    ..
-                } => {
-                    dragging = false;
-                }
-                Event::MouseMoved {
-                    x, y
-                } => {
-                    let cur = Vector2i::new(x, y);
-                    if dragging {
-                        let delta =  cur - prev_mouse_pos;
-                        view.move_(-Vector2f::new(delta.x as f32, delta.y as f32));
-                        win.set_view(&view);
-                        dirty = true;
-                    }
-                    prev_mouse_pos = cur;
-                }
-                Event::LostFocus => {
-                    dragging = false;
-                }
-                _ => {}
-            }
-
-            if let Some(win_change) = scheduled_win_change.take() {
-                win = win_change;
-                win.set_position(Vector2i::default());
-                win.set_vertical_sync_enabled(true);
-                dirty = true;
-            }
-
-            if dirty {
-                win.clear(Color::BLACK);
-                win.draw(&sprite);
-                win.display();
-                dirty = false;
             }
         }
-    }
-}
-
-fn resize_keep_ratio(
-    new_width: u32,
-    new_height: u32,
-    (target_width, target_height): (u32, u32),
-) -> Rect<f32> {
-    use std::cmp::Ordering;
-
-    if new_width == 0 || new_height == 0 {
-        return Rect::default();
-    }
-
-    assert!(target_width != 0 && target_height != 0);
-
-    let screen_width = new_width as f32 / target_width as f32;
-    let screen_height = new_height as f32 / target_height as f32;
-
-    let mut viewport = Rect::new(0.0, 0.0, 1.0, 1.0);
-    match screen_width.partial_cmp(&screen_height) {
-        Some(Ordering::Greater) => {
-            viewport.width = screen_height / screen_width;
-            viewport.left = 0.5 * (1.0 - viewport.width);
+        Event::RedrawRequested(_) => {
+            state.update();
+            state.render();
         }
-        Some(Ordering::Less) => {
-            viewport.height = screen_width / screen_height;
-            viewport.top = 0.5 * (1.0 - viewport.height);
+        Event::MainEventsCleared => {
+            window.request_redraw();
         }
         _ => {}
-    }
-
-    viewport
-}
-
-fn center_and_maximize(win: &RenderWindow, tex: &Texture, sprite: &mut Sprite) {
-    let win_real_size = win.size();
-    let tex_size = tex.size();
-    let y_ratio = win_real_size.y as f32 / tex_size.y as f32;
-    let x_ratio = win_real_size.x as f32 / tex_size.x as f32;
-    if y_ratio < x_ratio {
-        let sw = (y_ratio * tex_size.x as f32) as u32;
-        let offx = (win_real_size.x - sw) / 2;
-        sprite.set_position(Vector2f::new(offx as f32, 0.0));
-        sprite.set_scale(Vector2f::new(y_ratio, y_ratio));
-    } else {
-        let sh = (x_ratio * tex_size.y as f32) as u32;
-        let offy = (win_real_size.y - sh) / 2;
-        sprite.set_position(Vector2f::new(0.0, offy as f32));
-        sprite.set_scale(Vector2f::new(x_ratio, x_ratio));
-    }
+    });
 }
